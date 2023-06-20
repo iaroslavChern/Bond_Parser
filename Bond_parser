@@ -1,0 +1,245 @@
+import time
+from urllib import parse
+import requests
+import pandas as pd
+from pprint import pprint
+import traceback
+import asyncio
+import aiohttp
+
+
+def query(method: str, **kwargs):
+    """
+    Method to send request to moscow exchange
+    :param method:
+    :param kwargs:
+    :return:
+    """
+    try:
+        url = "https://iss.moex.com/iss/%s.json" % method
+        if kwargs:
+            if '_from' in kwargs: kwargs['from'] = kwargs.pop \
+                ('_from')
+            url += "?" + parse.urlencode(kwargs)
+        r = requests.get(url)
+        r.encoding = 'utf-8'
+        j = r.json()
+        return j
+
+    except Exception as ex:
+        # https://qna.habr.com/q/319621
+        print("query error %s" % str(ex))
+        time.sleep(5)
+        try_again = query(method, **kwargs)
+        traceback.print_exc()
+        return None
+
+
+def flatten(el: dict, blockname: str):
+    """
+    The function for creating a two-dimensional list consisting of dictionaries.
+    :param el: The dictionary obtained from MOEX
+    :param blockname: A key of the dictionary. {'securities':'data':{...},..., 'columns':{...}}
+    :return: A list of dictionaries
+    """
+    bond_of_one_page = []
+    for bond in el[blockname]['data']:
+        dict_bond = {}
+        for index, name in enumerate(el[blockname]['columns']):
+            dict_bond[str.lower(name)] = bond[index]
+        bond_of_one_page.append(dict_bond)
+
+    return bond_of_one_page
+
+
+def get_bonds(page=1, limit=10):
+    """
+    Method to get a list for traded bonds on the moscow exchange;
+    Method get only secid (ISIN) and a short name (the ticker) of bonds.
+    :param page: A number of page in bond list
+    :param limit:
+    :return:
+    """
+    element_of_data = query("securities", group_by="group", group_by_filter="stock_bonds", limit=limit,
+                            start=(page - 1) * limit)
+    f = flatten(element_of_data, 'securities')
+    return f
+    
+
+def yeild(secid: str, trading_mode):
+    """
+    Method for getting different data about a bond, a listing level, an offer date
+    :param secid: The ticker of a bond or ISIN of a bond
+    :param trading_mode: The indentifier of financial tools class
+    :return:
+    """
+    url_bond_data = f"engines/stock/markets/bonds/boards/{trading_mode}/securities/{secid}"
+    bond_data = query(url_bond_data)
+    securities_bond_data = flatten(bond_data, 'securities')
+    marketdata_bond_data = flatten(bond_data, 'marketdata')
+    # history_bond_data = flatten(bond_data, 'history')
+    # print(history_bond_data)
+    return marketdata_bond_data, securities_bond_data[0]['listlevel'], securities_bond_data[0]['offerdate']
+
+
+def get_list_of_bonds(trading_mode):
+    """
+    Method for getting a list of bonds and formation a Dataframe
+    :param trading_mode: The indentifier of financial tools class
+    :return:
+    p - a number of a page?
+    """
+    start_time = time.time()
+
+    all_frames = []
+    for p in range(1, 1000):
+        bonds = get_bonds(p, 100)
+        for bond in bonds:
+            if bond['is_traded'] == 1 and bond['regnumber'] != None and bond['primary_boardid'] == trading_mode:
+                new_row = [bond['secid'], bond['shortname']]
+                all_frames.append(new_row)
+        print("--- %s seconds ---" % round((time.time() - start_time), 2))
+
+        if len(bonds) < 1:
+            print("---   Completed   ---")
+            break
+    list_of_bonds = pd.DataFrame(all_frames, columns=['secid(isin)', 'shortname'])
+    return list_of_bonds
+
+
+def save_to_csv(trading_mode):
+    """
+    Method to save a dataframe to format .csv
+    :param trading_mode: The indentifier of financial tools class
+    :return:
+    """
+    list_of_bonds = get_list_of_bonds(trading_mode)
+    list_of_bonds.to_csv(trading_mode + ' list of bonds.csv', index=False, encoding='utf-16')
+    print(f'|   The bonds list is saved to {trading_mode}.csv   |')
+    return None
+
+
+def get_data_of_bonds(trading_mode, minimal_trade_volume, high_yield, low_yield):
+    """
+    Method for selecting bonds suitable for the requirements
+    key: 'secid': iss/securities/group/stock_bonds
+    key: 'shortname': iss/securities/group/stock_bonds
+    key: 'last': iss/engines/stock/markets/bonds/boards/TQCB/securities/{secid}/marketdata
+    key: 'yield': iss/engines/stock/markets/bonds/boards/TQCB/securities/{secid}/marketdata
+    key: 'duration': iss/engines/stock/markets/bonds/boards/TQCB/securities/{secid}/marketdata
+    key: 'voltoday': iss/engines/stock/markets/bonds/boards/TQCB/securities/{secid}/marketdata
+    key: 'listlevel': iss/engines/stock/markets/bonds/boards/TQCB/securities/{secid}/securities
+    key: 'offerdate': iss/engines/stock/markets/bonds/boards/TQCB/securities/{secid}/securities
+    :param trading_mode:
+    :param minimal_trade_volume: A minimal trade volume
+    :param high_yield: A highest bond yield
+    :param low_yield: A lowest bond yield
+    :return:
+    """
+    start_time = time.time()
+    list_bonds = pd.read_csv(trading_mode + ' list of bonds.csv', delimiter=',', encoding='utf-16')
+    all_frames = []
+    for id in range(0, len(list_bonds['secid(isin)']) - 1):
+        bond_data, list_level, offert = yeild(list_bonds['secid(isin)'][id], trading_mode)
+        if bond_data[0]['voltoday'] > minimal_trade_volume and bond_data[0]['yield'] < high_yield and \
+                bond_data[0]['yield'] > low_yield:
+            new_row = [list_bonds['secid(isin)'][id], list_bonds['shortname'][id], bond_data[0]['last'],
+                       bond_data[0]['yield'], bond_data[0]['duration'], bond_data[0]['voltoday'], list_level, offert,
+                       bond_data[0]['marketprice'], bond_data[0]['low']]
+            all_frames.append(new_row)
+        print("--- %s seconds ---" % round((time.time() - start_time), 2))
+    bonds = pd.DataFrame(all_frames,
+                         columns=['secid(isin)', 'shortname', 'Последняя цена, %', 'Доходность, %', 'Дюрация, дней',
+                                  'Объем торгов, шт', 'Уровень листинга', 'Оферта', 'Рыноч.цена пред.дня', 'Мин.цена'])
+    bonds.to_csv(trading_mode + ' data of bond.csv', index=False, encoding='utf-16')
+
+
+def visualiation_for_listings(X: dict, Y: dict, annotation: dict, caption, y_title):
+    import matplotlib.pyplot as plt
+    from mplcursors import cursor
+    # 1 Listing
+    plt.subplot(1, 3, 1)
+    plt.title('1 ЛИСТИНГ: ' + caption)
+    plt.scatter(X['1 listing'], Y['1 listing'])
+    plt.ylabel(y_title + ', %')
+    plt.xlabel('Дюрация, дней')
+    plt.grid()
+    ax = plt.gca()
+    for i, txt in enumerate(annotation['1 listing']):
+        ax.annotate(txt, (X['1 listing'][i], Y['1 listing'][i]), size=8)
+    # 2 Listing
+    plt.subplot(1, 3, 2)
+    plt.title('2 ЛИСТИНГ: ' + caption)
+    plt.scatter(X['2 listing'], Y['2 listing'])
+    plt.ylabel(y_title + ', %')
+    plt.xlabel('Дюрация, дней')
+    plt.grid()
+    ax = plt.gca()
+    for i, txt in enumerate(annotation['2 listing']):
+        ax.annotate(txt, (X['2 listing'][i], Y['2 listing'][i]), size=8)
+    # 3 Listing
+    plt.subplot(1, 3, 3)
+    plt.title('3 ЛИСТИНГ: ' + caption)
+    plt.scatter(X['3 listing'], Y['3 listing'])
+    plt.ylabel(y_title + ', %')
+    plt.xlabel('Дюрация, дней')
+    plt.grid()
+    ax = plt.gca()
+    for i, txt in enumerate(annotation['3 listing']):
+        ax.annotate(txt, (X['3 listing'][i], Y['3 listing'][i]), size=8)
+    cursor(hover=True)
+    plt.show()
+
+
+def visualization(turn_without_offerts, trading_mode):
+    """
+    Function for calculating different statistical metrics
+    :param turn_without_offerts:
+    :param trading_mode:
+    :return:
+    """
+    import numpy as np
+    data_bonds = pd.read_csv(trading_mode + ' data of bond.csv', delimiter=',', encoding='utf-16')
+
+    durations = {'1 listing': [], '2 listing': [], '3 listing': []}
+    yields = {'1 listing': [], '2 listing': [], '3 listing': []}
+    shortname_list = {'1 listing': [], '2 listing': [], '3 listing': []}
+    spread = {'1 listing': [], '2 listing': [], '3 listing': []}
+    for index in range(0, len(data_bonds['secid(isin)'])):
+        for level in range(1, 4):
+            if turn_without_offerts == True:
+                if type(data_bonds['Оферта'][index]) == np.float_ or type(data_bonds['Оферта'][index]) == float:
+                    if data_bonds['Уровень листинга'][index] == level:
+                        durations[str(level) + ' listing'].append(data_bonds['Дюрация, дней'][index])
+                        yields[str(level) + ' listing'].append(data_bonds['Доходность, %'][index])
+                        shortname_list[str(level) + ' listing'].append(data_bonds['shortname'][index])
+                        spread_value = data_bonds['Рыноч.цена пред.дня'][index] - data_bonds['Мин.цена'][index]
+                        spread[str(level) + ' listing'].append(spread_value)
+                        break
+            else:
+                if data_bonds['Уровень листинга'][index] == level:
+                    durations[str(level) + ' listing'].append(data_bonds['Дюрация, дней'][index])
+                    yields[str(level) + ' listing'].append(data_bonds['Доходность, %'][index])
+                    shortname_list[str(level) + ' listing'].append(data_bonds['shortname'][index])
+                    break
+    visualiation_for_listings(durations, yields, shortname_list, caption='доходность', y_title='доходность')
+    visualiation_for_listings(durations, spread, shortname_list, caption='спред в ценах', y_title='спред')
+
+
+if __name__ == '__main__':
+    trading_mode = 'TQCB'
+    minimal_trade_volume = 50  # A minimal trade volume
+    high_yield = 40  # A highest bond yield
+    low_yield = 5  # A lowest bond yield
+    turn_without_offerts = True  # Not to show papers with offers.
+
+    enter = input('Need to update the bond database?  ')
+    if enter == 'no':
+        visualization(turn_without_offerts, trading_mode)
+    elif enter == 'yes':
+        get_data_of_bonds(trading_mode, minimal_trade_volume, high_yield, low_yield)
+    elif enter == 'all':
+        save_to_csv(trading_mode)
+        get_data_of_bonds(trading_mode, minimal_trade_volume, high_yield, low_yield)
+    else:
+        print('Incorrect answer, try again.')
